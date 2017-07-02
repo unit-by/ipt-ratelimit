@@ -1,4 +1,5 @@
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3,19,0)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3,19,0) && \
+	!(defined(RHEL_MAJOR) && RHEL_MAJOR == 7 && RHEL_MINOR > 2)
 static inline bool seq_has_overflowed(struct seq_file *m)
 {
 	return m->count == m->size;
@@ -39,4 +40,11 @@ static inline struct inode *file_inode(const struct file *f)
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(3, 10, 0)
 # define PDE_DATA(inode) PDE(inode)->data
+#endif
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,10,0)
+static inline u_int8_t xt_family(const struct xt_action_param *par)
+{
+		return par->family;
+}
 #endif

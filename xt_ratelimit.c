@@ -1,6 +1,6 @@
 /*
  * An implementation of committed access rate for Linux iptables
- * (c) 2015 <abc@telekom.ru>
+ * (c) 2015-2017 <abc@telekom.ru>
  *
  * Based on xt_hashlimit and in lesser extent on xt_recent.
  *
@@ -34,6 +34,7 @@
 #include <linux/inet.h>
 #include <linux/in.h>
 #include <linux/ip.h>
+#include <linux/ipv6.h>
 #include <net/net_namespace.h>
 #include <net/netns/generic.h>
 #include <linux/netfilter/x_tables.h>
@@ -43,7 +44,7 @@
 #include "compat.h"
 #include "xt_ratelimit.h"
 
-#define XT_RATELIMIT_VERSION "0.2"
+#define XT_RATELIMIT_VERSION "0.3"
 #include "version.h"
 #ifdef GIT_VERSION
 # undef XT_RATELIMIT_VERSION
@@ -55,6 +56,7 @@ MODULE_DESCRIPTION("iptables ratelimit policer mt module");
 MODULE_LICENSE("GPL");
 MODULE_VERSION(XT_RATELIMIT_VERSION);
 MODULE_ALIAS("ipt_ratelimit");
+MODULE_ALIAS("ip6t_ratelimit");
 
 #define RATE_ESTIMATOR			/* average rate estimator */
 
@@ -85,15 +87,15 @@ struct ratelimit_car {
 
 	u32 cbs;			/* committed burst size (bytes) */
 	u32 ebs;			/* extended burst size (bytes) */
-	u32 cir;			/* committed information rate (bits/s) */
+	u32 cir;			/* committed information rate (bits/s) / (HZ * 8) */
 };
 
+/* stat not related to policing */
 struct ratelimit_stat {
-	u64 green_bytes;
-	u64 red_bytes;
-	u32 green_pkt;
-	u32 red_pkt;
-	unsigned long first;		/* first time seen */
+	atomic64_t green_bytes;
+	atomic64_t red_bytes;
+	atomic_t green_pkt;
+	atomic_t red_pkt;
 
 #ifdef RATE_ESTIMATOR
 #define RATEST_SECONDS 4		/* length of rate estimator time slot */
@@ -104,14 +106,16 @@ struct ratelimit_stat {
 #endif
 };
 
-/* hash bucket entity */
+/* hash bucket match entry */
 struct ratelimit_match {
 	struct hlist_node node;		/* hash bucket list */
-	__be32 addr;
-	struct ratelimit_ent *ent;	/* owner */
+	u8 family;
+	u8 prefix;
+	union nf_inet_addr addr;
+	struct ratelimit_ent *ent;	/* owner struct, where they are stored in array */
 };
 
-/* set enitiy: can have many IPs */
+/* set entity: can have many IPs */
 struct ratelimit_ent {
 	struct rcu_head rcu;		/* destruction call list */
 	int mtcnt;			/* size of matches[mtcnt] */
@@ -119,12 +123,17 @@ struct ratelimit_ent {
 	struct ratelimit_car car;
 	spinlock_t lock_bh;
 
-		/* variable sized array for actual hash entries, it's
-		 * to optimize memory allocation and data locality
-		 * (without too much hope, though, becasue car and stat
-		 * structs are too big to fit into same cache line */
+	/* variable sized array to store actual hash match entries (instead of
+	 * a list) belonging to a single policing entity */
 	struct ratelimit_match matches[0];
 };
+
+#define MAX_PREFIX4 32
+#define NUM_PREFIX4 (MAX_PREFIX4 + 1)
+#define MAX_PREFIX6 128
+#define NUM_PREFIX6 (MAX_PREFIX6 + 1)
+#define MAX_PREFIX  MAX_PREFIX6
+#define NUM_PREFIX  NUM_PREFIX6
 
 /* per-net named hash table, locked with ratelimit_mutex */
 struct xt_ratelimit_htable {
@@ -133,11 +142,13 @@ struct xt_ratelimit_htable {
 	spinlock_t lock;		/* write access to hash */
 	unsigned int mt_count;		/* currently matches in the hash */
 	unsigned int ent_count;		/* currently entities linked */
-	unsigned int size;		/* hash array size */
+	unsigned int size;		/* hash array size, set from hashsize */
 	int other;			/* what to do with 'other' packets */
 	struct net *net;		/* for destruction */
 	struct proc_dir_entry *pde;
 	char name[XT_RATELIMIT_NAME_LEN];
+	int prefix_count[NUM_PREFIX];	/* housekeeping of bitmask */
+	DECLARE_BITMAP(prefix_bitmap, NUM_PREFIX);
 	struct hlist_head hash[0];	/* rcu lists array[size] of ratelimit_match'es */
 };
 
@@ -168,8 +179,7 @@ unsigned long calc_rate_est(const struct ratelimit_stat *stat)
 	{
 		const unsigned int slot_delta_rtime = RATEST_JIFFIES - (now % RATEST_JIFFIES);
 #define SMOOTH_VAUE 10 /* smoothen integer arithmetics */
-		const unsigned int prev_ratio = (slot_delta_rtime)?
-			RATEST_JIFFIES * SMOOTH_VAUE / slot_delta_rtime : SMOOTH_VAUE;
+		const unsigned int prev_ratio = RATEST_JIFFIES * SMOOTH_VAUE / slot_delta_rtime;
 
 		bps = bps * SMOOTH_VAUE / prev_ratio;
 		bps += cur_bytes;
@@ -193,12 +203,20 @@ static int ratelimit_seq_ent_show(struct ratelimit_match *mt,
 	/* lock for consistent reads from the counters */
 	spin_lock_bh(&ent->lock_bh);
 	for (i = 0; i < ent->mtcnt; i++) {
-		seq_printf(s, "%s%pI4",
-		    i == 0? "" : ",",
-		    &ent->matches[i].addr);
+		struct ratelimit_match *mti = &ent->matches[i];
+
+		if (mti->family == AF_INET6) {
+			seq_printf(s, "%s%pI6c", i == 0? "" : ",", &mti->addr);
+			if (mti->prefix != 128)
+				seq_printf(s, "/%d", mti->prefix);
+		} else {
+			seq_printf(s, "%s%pI4", i == 0? "" : ",", &mti->addr);
+			if (mti->prefix != 32)
+				seq_printf(s, "/%d", mti->prefix);
+		}
 	}
 	seq_printf(s, " cir %u cbs %u ebs %u;",
-	    ent->car.cir, ent->car.cbs, ent->car.ebs);
+	    ent->car.cir * (HZ * BITS_PER_BYTE), ent->car.cbs, ent->car.ebs);
 
 	seq_printf(s, " tc %u te %u last", ent->car.tc, ent->car.te);
 	if (ent->car.last)
@@ -207,14 +225,16 @@ static int ratelimit_seq_ent_show(struct ratelimit_match *mt,
 		seq_printf(s, " never;");
 
 	seq_printf(s, " conf %u/%llu",
-	    ent->stat.green_pkt, ent->stat.green_bytes);
+	    (u32)atomic_read(&ent->stat.green_pkt),
+		 (u64)atomic64_read(&ent->stat.green_bytes));
 
 #ifdef RATE_ESTIMATOR
 	seq_printf(s, " %lu bps", calc_rate_est(&ent->stat));
 #endif
 
 	seq_printf(s, ", rej %u/%llu",
-	    ent->stat.red_pkt, ent->stat.red_bytes);
+	    (u32)atomic_read(&ent->stat.red_pkt),
+		 (u64)atomic64_read(&ent->stat.red_bytes));
 
 	seq_printf(s, "\n");
 
@@ -300,11 +320,47 @@ static int ratelimit_proc_open(struct inode *inode, struct file *file)
 	return ret;
 }
 
+static inline u32 bits2mask(int bits) {
+	return (bits? 0xffffffff << (32 - bits) : 0);
+}
+
 static void ratelimit_table_flush(struct xt_ratelimit_htable *ht);
 static struct ratelimit_ent *ratelimit_ent_zalloc(int msize);
-static inline struct ratelimit_ent *ratelimit_match_find(const struct xt_ratelimit_htable *ht, const __be32 addr);
+static inline struct ratelimit_ent *ratelimit_match_find(const struct xt_ratelimit_htable *ht, const __be32 addr, const u8 prefix);
+static inline struct ratelimit_ent *ratelimit_match_find6(const struct xt_ratelimit_htable *ht, const union nf_inet_addr *addr, const u8 prefix);
 static void ratelimit_ent_add(struct xt_ratelimit_htable *ht, struct ratelimit_ent *ent);
 static void ratelimit_ent_del(struct xt_ratelimit_htable *ht, struct ratelimit_ent *ent);
+
+/* convert ipv4 or ipv6 address string into struct sockaddr */
+int in_pton(const char *src, int srclen, struct sockaddr_storage *dst, int delim, const char **end)
+{
+	if (in4_pton(src, srclen, (u8 *)&((struct sockaddr_in *)dst)->sin_addr, delim, end)) {
+		dst->ss_family = AF_INET;
+		return 1;
+	} else if (in6_pton(src, srclen, (u8 *)&((struct sockaddr_in6 *)dst)->sin6_addr, delim, end)) {
+		dst->ss_family = AF_INET6;
+		return 1;
+	} else
+		return 0;
+}
+
+static __be32 set_netmask(short prefix)
+{
+	if (prefix <= 0)
+		return 0;
+	else if (prefix >= 32)
+		return 0xffffffff;
+	else
+		return htonl(0xffffffff << (32 - prefix));
+}
+
+static void set_mask6(union nf_inet_addr *ip, u8 prefix)
+{
+	ip->ip6[0] = set_netmask((short)prefix);
+	ip->ip6[1] = set_netmask((short)prefix - 32);
+	ip->ip6[2] = set_netmask((short)prefix - 64);
+	ip->ip6[3] = set_netmask((short)prefix - 96);
+}
 
 static int parse_rule(struct xt_ratelimit_htable *ht, char *str, size_t size)
 {
@@ -313,7 +369,7 @@ static int parse_rule(struct xt_ratelimit_htable *ht, char *str, size_t size)
 	const char * const endp = str + size;
 	struct ratelimit_ent *ent;	/* new entry */
 	struct ratelimit_ent *ent_chk;	/* old entry */
-	__be32 addr;
+	struct sockaddr_storage addr;
 	int ent_size;
 	int add;
 	int i;
@@ -374,9 +430,11 @@ static int parse_rule(struct xt_ratelimit_htable *ht, char *str, size_t size)
 	/* determine address set size */
 	ent_size = 0;
 	for (p = str;
-	    p < endp && *p && (ptok = in4_pton(p, size - (p - str), (u8 *)&addr, -1, &p));
+	    p < endp && *p && (ptok = in_pton(p, size - (p - str), &addr, -1, &p));
 	    ++p) {
 		++ent_size;
+		if ((p + 1) < endp && *p == '/')
+			for (++p; p < endp && *p >= '0' && *p <= '9'; ++p);
 		if (p >= endp || !*p || *p == ' ')
 			break;
 		else if (*p != ',') {
@@ -396,20 +454,45 @@ static int parse_rule(struct xt_ratelimit_htable *ht, char *str, size_t size)
 
 	spin_lock_init(&ent->lock_bh);
 	for (i = 0, p = str;
-	    p < endp && *p && in4_pton(p, size - (p - str), (u8 *)&addr, -1, &p);
+	    p < endp && *p && in_pton(p, size - (p - str), &addr, -1, &p);
 	    ++p, ++i) {
 		struct ratelimit_match *mt = &ent->matches[i];
 		int j;
+		unsigned int prefix = -1;
+		const char *pref;
+		union nf_inet_addr mask;
 
 		BUG_ON(i >= ent_size);
-		mt->addr = addr;
+		if ((p + 1) < endp && *p == '/') {
+			for (++p, pref = p; p < endp && *p >= '0' && *p <= '9'; ++p);
+			prefix = simple_strtoul(pref, NULL, 10);
+		}
+		mt->family = addr.ss_family;
+		if (mt->family == AF_INET6) {
+			if (prefix > 128)
+				prefix = 128;
+			memcpy(mt->addr.ip6, &((struct sockaddr_in6 *)&addr)->sin6_addr, sizeof(mt->addr.ip6));
+		} else {
+			if (prefix > 32)
+			       prefix = 32;
+			mt->addr.ip = ((struct sockaddr_in *)&addr)->sin_addr.s_addr;
+		}
+
+		/* following works both for ip and ip6, also cleaning stale bits,
+		 * and they assumed to be clean in the below memcmp */
+		set_mask6(&mask, prefix);
+		for (j = 0; j < ARRAY_SIZE(mt->addr.ip6); ++j)
+			mt->addr.ip6[j] &= mask.ip6[j];
+
+		mt->prefix = prefix;
 		mt->ent = ent;
 		++ent->mtcnt;
 		/* there should not be duplications,
 		 * this is also important for below test of mtcnt */
 		for (j = 0; j < i; ++j)
-			if (ent->matches[j].addr == addr) {
-				pr_err("Duplicated IP address %pI4 in list (cmd: %s)\n", &addr, buf);
+			if (ent->matches[j].family == mt->family &&
+			    !memcmp(ent->matches[j].addr.ip6, mt->addr.ip6, sizeof(mt->addr.ip6))) {
+				pr_err("Duplicated IP address %pISc in list (cmd: %s)\n", &addr, buf);
 				kvfree(ent);
 				return -EINVAL;
 			}
@@ -442,7 +525,7 @@ static int parse_rule(struct xt_ratelimit_htable *ht, char *str, size_t size)
 		val = simple_strtoul(v, NULL, 10);
 		switch (i) {
 			case 0:
-				ent->car.cir = val;
+				ent->car.cir = val / (HZ * BITS_PER_BYTE);
 				/* autoconfigure optimal parameters */
 				val = val / 8 + (val / 8 / 2);
 				/* FALLTHROUGH */
@@ -467,13 +550,20 @@ static int parse_rule(struct xt_ratelimit_htable *ht, char *str, size_t size)
 		struct ratelimit_match *mt = &ent->matches[i];
 		struct ratelimit_ent *tent;
 
-		tent = ratelimit_match_find(ht, mt->addr);
+		if (mt->family == AF_INET6)
+			tent = ratelimit_match_find6(ht, &mt->addr, mt->prefix);
+		else
+			tent = ratelimit_match_find(ht, mt->addr.ip, mt->prefix);
 		if (!ent_chk)
 			ent_chk = tent;
 		if (tent != ent_chk) {
 			/* no operation should reference multiple entries */
-			pr_err("IP address %pI4 from multiple rules (cmd: %s)\n",
-			    &mt->addr,  buf);
+			if (mt->family == AF_INET6)
+				pr_err("IP address %pI6c from multiple rules (cmd: %s)\n",
+				    &mt->addr,  buf);
+			else
+				pr_err("IP address %pI4 from multiple rules (cmd: %s)\n",
+				    &mt->addr,  buf);
 			goto unlock_einval;
 		}
 	}
@@ -605,6 +695,9 @@ static int htable_create(struct net *net, struct xt_ratelimit_mtinfo *minfo)
 	ht->use = 1;
 	ht->mt_count = 0;
 	ht->ent_count = 0;
+	bitmap_zero(ht->prefix_bitmap, NUM_PREFIX);
+	for (i = 0; i < NUM_PREFIX; i++)
+		ht->prefix_count[i] = 0;
 	strcpy(ht->name, minfo->name);
 	spin_lock_init(&ht->lock);
 	ht->pde = proc_create_data(minfo->name, 0644, ratelimit_net->ipt_ratelimit,
@@ -626,22 +719,59 @@ hash_addr(const struct xt_ratelimit_htable *ht, const __be32 addr)
 	return reciprocal_scale(jhash_1word(addr, 0), ht->size);
 }
 
+static inline u_int32_t
+hash_addr6(const struct xt_ratelimit_htable *ht, const __be32 addr[])
+{
+	return reciprocal_scale(jhash2(addr, 4, 0), ht->size);
+}
+
 /* get (car) entity by address */
 static inline struct ratelimit_ent *
-ratelimit_match_find(const struct xt_ratelimit_htable *ht,
-    const __be32 addr)
+ratelimit_match_find(const struct xt_ratelimit_htable *ht, const __be32 addr, const u8 prefix)
 {
-	const u_int32_t hash = hash_addr(ht, addr);
+	const __be32 mask = htonl(bits2mask(prefix));
+	const __be32 addr_masked = addr & mask;
+	const u_int32_t hash = hash_addr(ht, addr_masked);
 
 	if (!hlist_empty(&ht->hash[hash])) {
 		struct ratelimit_match *mt;
 #if LINUX_VERSION_CODE < KERNEL_VERSION(3,9,0)
 		struct hlist_node *pos;
 #endif
-
-		compat_hlist_for_each_entry_rcu(mt, pos, &ht->hash[hash], node)
-			if (mt->addr == addr)
+		compat_hlist_for_each_entry_rcu(mt, pos, &ht->hash[hash], node) {
+			if (mt->family == AF_INET &&
+			    mt->prefix == prefix &&
+			    mt->addr.ip == addr_masked)
 				return mt->ent;
+		}
+	}
+	return NULL;
+}
+
+static inline struct ratelimit_ent *
+ratelimit_match_find6(const struct xt_ratelimit_htable *ht, const union nf_inet_addr *addr, const u8 prefix)
+{
+	union nf_inet_addr mask;
+	union nf_inet_addr addr_masked;
+	u_int32_t hash;
+	unsigned int i;
+
+	set_mask6(&mask, prefix);
+	for (i = 0; i < ARRAY_SIZE(addr->ip6); ++i)
+		addr_masked.ip6[i] = addr->ip6[i] & mask.ip6[i];
+	hash = hash_addr6(ht, addr_masked.ip6);
+
+	if (!hlist_empty(&ht->hash[hash])) {
+		struct ratelimit_match *mt;
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3,9,0)
+		struct hlist_node *pos;
+#endif
+		compat_hlist_for_each_entry_rcu(mt, pos, &ht->hash[hash], node) {
+			if (mt->family == AF_INET6 &&
+			    mt->prefix == prefix &&
+			    !memcmp(&mt->addr, &addr_masked, sizeof(addr->ip6)))
+				return mt->ent;
+		}
 	}
 	return NULL;
 }
@@ -678,10 +808,14 @@ static void ratelimit_match_free(struct xt_ratelimit_htable *ht,
 	/* under ht->lock */
 {
 	struct ratelimit_ent *ent = mt->ent;
+	const unsigned int max_prefix = (mt->family == AF_INET6)? MAX_PREFIX6 : MAX_PREFIX4;
 
 	hlist_del_rcu(&mt->node);
 	BUG_ON(ht->mt_count == 0);
 	--ht->mt_count;
+
+	if (--ht->prefix_count[mt->prefix] == 0)
+		clear_bit(max_prefix - mt->prefix, ht->prefix_bitmap);
 
 	BUG_ON(ent->mtcnt == 0);
 	if (--ent->mtcnt == 0) {
@@ -745,9 +879,16 @@ static void ratelimit_ent_add(struct xt_ratelimit_htable *ht,
 	/* add each match address into htable hash */
 	for (i = 0; i < ent->mtcnt; i++) {
 		struct ratelimit_match *mt = &ent->matches[i];
+		const u_int32_t hash = (mt->family == AF_INET6) ?
+			hash_addr6(ht, mt->addr.ip6) : hash_addr(ht, mt->addr.ip);
+		const unsigned int max_prefix = (mt->family == AF_INET6)? MAX_PREFIX6 : MAX_PREFIX4;
 
-		hlist_add_head_rcu(&mt->node, &ht->hash[hash_addr(ht, mt->addr)]);
+		hlist_add_head_rcu(&mt->node, &ht->hash[hash]);
 		ht->mt_count++;
+		/* mark bits in reverse order, becasue I need to search
+		 * from highest mask to lowest */
+		if (++ht->prefix_count[mt->prefix] == 1)
+			set_bit(max_prefix - mt->prefix, ht->prefix_bitmap);
 	}
 	ht->ent_count++;
 }
@@ -757,6 +898,7 @@ static void htable_destroy(struct xt_ratelimit_htable *ht)
 	/* under ratelimit_mutex */
 {
 	struct ratelimit_net *ratelimit_net = ratelimit_pernet(ht->net);
+	int i;
 
 	/* ratelimit_net_exit() can independently unregister
 	 * proc entries */
@@ -767,6 +909,9 @@ static void htable_destroy(struct xt_ratelimit_htable *ht)
 	htable_cleanup(ht);
 	BUG_ON(ht->mt_count != 0);
 	BUG_ON(ht->ent_count != 0);
+	BUG_ON(!bitmap_empty(ht->prefix_bitmap, NUM_PREFIX));
+	for (i = 0; i < NUM_PREFIX; i++)
+		BUG_ON(ht->prefix_count[i]);
 	kvfree(ht);
 }
 
@@ -826,52 +971,71 @@ ratelimit_mt(const struct sk_buff *skb, struct xt_action_param *par)
 {
 	const struct xt_ratelimit_mtinfo *mtinfo = par->matchinfo;
 	struct xt_ratelimit_htable *ht = mtinfo->ht;
-	struct ratelimit_ent *ent;
+	struct ratelimit_ent *ent = NULL;
 	const unsigned long now = jiffies;
-	__be32 addr;
+	union nf_inet_addr addr;
+	const u8 family = xt_family(par);
+	int invprefix;
 	int match = false; /* no match, no drop */
 
-	if (mtinfo->mode & XT_RATELIMIT_DST)
-		addr = ip_hdr(skb)->daddr;
-	else
-		addr = ip_hdr(skb)->saddr;
+	if (unlikely(family == NFPROTO_IPV6)) {
+		const struct ipv6hdr *iph = ipv6_hdr(skb);
+		memcpy(addr.ip6, (mtinfo->mode & XT_RATELIMIT_DST) ?
+		    &iph->daddr : &iph->saddr, sizeof(addr.ip6));
+	} else {
+		const struct iphdr *iph = ip_hdr(skb);
+		addr.ip = (mtinfo->mode & XT_RATELIMIT_DST) ?
+			iph->daddr : iph->saddr;
+	}
 
 	rcu_read_lock();
-	ent = ratelimit_match_find(ht, addr);
+	/* first match from longest prefix upwards */
+	if (unlikely(family == NFPROTO_IPV6)) {
+		for_each_set_bit(invprefix, ht->prefix_bitmap, NUM_PREFIX6) {
+			if ((ent = ratelimit_match_find6(ht, &addr, MAX_PREFIX6 - invprefix)))
+				break;
+		}
+	} else {
+		for_each_set_bit(invprefix, ht->prefix_bitmap, NUM_PREFIX4) {
+			if ((ent = ratelimit_match_find(ht, addr.ip, MAX_PREFIX4 - invprefix)))
+				break;
+		}
+	}
 	if (ent) {
 		struct ratelimit_car *car = &ent->car;
 		const unsigned int len = skb->len; /* L3 */
-		const unsigned long delta_ms = (now - car->last) * (MSEC_PER_SEC / HZ);
+		u32 tok;
 
 		spin_lock(&ent->lock_bh);
+		tok = (now - car->last) * car->cir;
 		car->tc += len;
-		if (delta_ms) {
-			const u32 tok = delta_ms * (car->cir / (BITS_PER_BYTE * MSEC_PER_SEC));
-
+		if (tok) {
 			car->tc -= min(tok, car->tc);
-			if (!ent->stat.first)
-				ent->stat.first = now;
 			car->last = now;
 		}
 		if (car->tc > car->cbs) { /* extended burst */
 			car->te += car->tc - car->cbs;
 			if (car->te > car->ebs) {
 				car->te = 0;
+				car->tc -= len;
 				match = true; /* match is drop */
 			}
 		}
-		if (match) {
-			ent->stat.red_bytes += len;
-			ent->stat.red_pkt++;
-			car->tc -= len;
-		} else {
-			ent->stat.green_bytes += len;
-			ent->stat.green_pkt++;
+
 #ifdef RATE_ESTIMATOR
+		if (!match) {
 			rate_estimator(&ent->stat, now / RATEST_JIFFIES, len);
-#endif
 		}
+#endif
 		spin_unlock(&ent->lock_bh);
+
+		if (match) {
+			atomic64_add(len, &ent->stat.red_bytes);
+			atomic_inc(&ent->stat.red_pkt);
+		} else {
+			atomic64_add(len, &ent->stat.green_bytes);
+			atomic_inc(&ent->stat.green_pkt);
+		}
 	} else {
 		if (ht->other == OT_MATCH)
 			match = true; /* match is drop */
@@ -914,7 +1078,7 @@ static void ratelimit_mt_destroy(const struct xt_mtdtor_param *par)
 static struct xt_match ratelimit_mt_reg[] __read_mostly = {
 	{
 		.name		= "ratelimit",
-		.family		= NFPROTO_IPV4,
+		.family		= NFPROTO_UNSPEC,
 		.match		= ratelimit_mt,
 		.matchsize	= sizeof(struct xt_ratelimit_mtinfo),
 		.checkentry	= ratelimit_mt_check,
